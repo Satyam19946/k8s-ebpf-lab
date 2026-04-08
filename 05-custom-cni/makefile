@@ -1,0 +1,26 @@
+CLANG   = clang
+CC      = gcc
+CFLAGS  = -O2 -g -target bpf -D__TARGET_ARCH_x86 \
+          -I/usr/include/x86_64-linux-gnu
+LDFLAGS = -lbpf
+
+PROGRAMS = tc_drop tc_drop_map
+
+.PHONY: all clean $(PROGRAMS)
+
+all: $(PROGRAMS)
+
+tc_drop:
+	$(CLANG) $(CFLAGS) -c tc_drop/tc_drop.bpf.c -o tc_drop/tc_drop.bpf.o
+	$(CC) -O2 -g -o tc_drop/tc_drop_loader \
+		tc_drop/tc_drop_loader.c $(LDFLAGS)
+
+tc_drop_map:
+	$(CLANG) $(CFLAGS) -c tc_drop_map/tc_drop_map.bpf.c \
+		-o tc_drop_map/tc_drop_map.bpf.o
+	$(CC) -O2 -g -o tc_drop_map/tc_drop_map_loader \
+		tc_drop_map/tc_drop_map_loader.c $(LDFLAGS)
+
+clean:
+	find . -name "*.bpf.o" -delete
+	find . -name "*_loader" -delete
