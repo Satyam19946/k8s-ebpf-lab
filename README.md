@@ -12,8 +12,8 @@ replacing the networking stack with eBPF programs written in C.
 ## Phases
 | Phase | Topic | Status |
 |-------|-------|--------|
-| 01 | Cluster Setup — Vagrant + kubeadm | 🔨 In Progress |
-| 02 | Kubernetes Networking Internals | ⏳ Pending |
-| 03 | eBPF Fundamentals | ⏳ Pending |
+| 01 | Cluster Setup — Vagrant + kubeadm | ✅ Complete |
+| 02 | Kubernetes Networking Internals    | ✅ Complete |
+| 03 | eBPF Fundamentals                  | 🔨 In Progress |
 | 04 | Cilium — eBPF CNI in Practice | ⏳ Pending |
 | 05 | Custom eBPF CNI from Scratch | ⏳ Pending |
