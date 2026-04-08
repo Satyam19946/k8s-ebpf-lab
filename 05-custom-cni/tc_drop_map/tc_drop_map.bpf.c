@@ -43,6 +43,10 @@ int tc_drop_map(struct __sk_buff *skb){
         return TC_ACT_OK;
     }
 
+    /* 
+        This is needed cause the args to bpf_map_lookup_elem 
+        has to be a PTR_TO_STACK or PTR_TO_MAP_VALUE
+    */
     struct conn_key key = {};
     key.src_addr    = iph->saddr;
     key.proto       = iph->protocol;
