@@ -51,7 +51,7 @@ k8s-ebpf-lab/
 ```
 
 BPF programs from Phase 04 live in a companion repository:
-**[bpf_code](https://github.com/satyamakgec/bpf_code)**
+**[bpf_code](https://github.com/satyam19946/bpf_code)**
 
 ## Phase summaries
 
@@ -103,7 +103,7 @@ writing a single line of code.
 
 Six BPF programs written from scratch in C on the local machine, each
 introducing one new concept. See the companion
-[bpf_code](https://github.com/satyamakgec/bpf_code) repository and
+[bpf_code](https://github.com/satyam19946/bpf_code) repository and
 [04-bpf-programming/README.md](04-bpf-programming/README.md) for full details.
 
 | Program | Core concept |
