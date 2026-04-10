@@ -4,7 +4,7 @@ CFLAGS  = -O2 -g -target bpf -D__TARGET_ARCH_x86 \
           -I/usr/include/x86_64-linux-gnu
 LDFLAGS = -lbpf
 
-PROGRAMS = tc_drop tc_drop_map mycni xdp_lb
+PROGRAMS = tc_drop tc_drop_map mycni xdp_lb tc_policy
 
 .PHONY: all clean $(PROGRAMS)
 
@@ -28,6 +28,12 @@ xdp_lb:
 	$(CLANG) $(CFLAGS) -c xdp_lb/xdp_lb.bpf.c -o xdp_lb/xdp_lb.bpf.o
 	$(CC) -O2 -g -o xdp_lb/xdp_lb_loader \
 		xdp_lb/xdp_lb_loader.c $(LDFLAGS)
+
+tc_policy:
+	$(CLANG) $(CFLAGS) -c tc_policy/tc_policy.bpf.c \
+		-o tc_policy/tc_policy.bpf.o
+	$(CC) -O2 -g -o tc_policy/tc_policy_loader \
+		tc_policy/tc_policy_loader.c $(LDFLAGS)
 
 clean:
 	find . -name "*.bpf.o" -delete
