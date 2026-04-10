@@ -20,6 +20,19 @@ struct policy_val {
     __u8    pad[3];
 };
 
+struct ct_key {
+    __be32  src_ip;
+    __be32  dst_ip;
+    __be16  src_port;
+    __be16  dst_port;
+    __u8    proto;
+    __u8    pad[3];
+};
+
+struct ct_val {
+    __u8    state;   /* 0 = new, 1 = established */
+    __u8    pad[3];
+};
 
 struct {
     __uint(type,        BPF_MAP_TYPE_HASH);
@@ -28,6 +41,12 @@ struct {
     __type(value,       struct policy_val);
 } policy_map SEC(".maps");
 
+struct {
+    __uint(type,        BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key,         struct ct_key);
+    __type(value,       struct ct_val);
+} ct_map SEC(".maps");
 
 SEC("tc")
 int tc_policy(struct __sk_buff *skb)
@@ -64,6 +83,21 @@ int tc_policy(struct __sk_buff *skb)
         return TC_ACT_OK;
     }
 
+    struct ct_key ctkey = {};
+
+    ctkey.src_ip    = iph->saddr;
+    ctkey.dst_ip    = iph->daddr;
+    ctkey.src_port  = tcp->source;
+    ctkey.dst_port  = tcp->dest;
+    ctkey.proto     = iph->protocol;
+
+    struct ct_val *ctval = bpf_map_lookup_elem(&ct_map, &ctkey);
+    if (ctval && ctval->state){
+        bpf_printk("Found connection in ct_map From:0x%08x:%d\n", 
+                    bpf_ntohl(ctkey.src_ip), bpf_ntohs(ctkey.src_port));
+        return TC_ACT_OK;
+    }
+
     struct policy_key key = {};
     key.src_ip      = iph->saddr;
     key.dst_ip      = iph->daddr;
@@ -75,6 +109,18 @@ int tc_policy(struct __sk_buff *skb)
     if (value && value->action == 1){
         bpf_printk("Allowing connection from 0x%08x to 0x%08x:%d\n",
                         bpf_ntohl(iph->saddr), bpf_ntohl(iph->daddr), bpf_ntohs(tcp->dest));
+        
+        struct ct_key reply_key = {};
+        reply_key.src_ip   = iph->daddr;
+        reply_key.dst_ip   = iph->saddr;
+        reply_key.src_port = tcp->dest;
+        reply_key.dst_port = tcp->source;
+        reply_key.proto    = iph->protocol;
+
+        struct ct_val ctv = {};
+        ctv.state = 1;
+        bpf_map_update_elem(&ct_map, &ctkey, &ctv, BPF_ANY);
+        bpf_map_update_elem(&ct_map, &reply_key, &ctv, BPF_ANY);
         return TC_ACT_OK;
     }
     bpf_printk("Blocking connection from 0x%08x to 0x%08x:%d\n",
