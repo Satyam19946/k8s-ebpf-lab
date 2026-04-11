@@ -30,7 +30,7 @@ the same thing from scratch.
 | 02 | Kubernetes Networking Internals | ✅ Complete |
 | 03 | eBPF Fundamentals — VM, Maps, Verifier, Program Types | ✅ Complete |
 | 04 | BPF Programming | ✅ Complete |
-| 05 | Custom eBPF CNI from Scratch | 🔄 In progress |
+| 05 | Custom eBPF CNI from Scratch | ✅ Complete |
 
 ## Repository structure
 
@@ -47,7 +47,14 @@ k8s-ebpf-lab/
 ├── 04-bpf-programming/
 │   └── README.md          ← links to companion bpf_code repo
 └── 05-custom-cni/
-    └── README.md          ← in progress
+    ├── README.md
+    ├── makefile
+    ├── setup.sh
+    ├── tc_drop/
+    ├── tc_drop_map/
+    ├── xdp_lb/
+    ├── mycni/
+    └── tc_policy/
 ```
 
 BPF programs from Phase 04 live in a companion repository:
@@ -61,95 +68,114 @@ Stood up a 3-node Kubernetes cluster using Vagrant + libvirt on KVM/QEMU.
 kubeadm v1.31, containerd as the CRI, kube-proxy intentionally skipped.
 Significant debugging around the KVM2 driver (minikube abandoned), flannel
 bootstrap failures due to the missing kube-proxy ClusterIP, and the CNI
-chicken-and-egg problem.
+chicken-and-egg problem resolved by passing `--kube-api-url` directly to
+flannel with a hostPath-mounted kubeconfig.
 
 Key outcome: fully healthy 3-node cluster, all nodes Ready, flannel running
 with VXLAN overlay, correct pod subnet routes on all nodes.
 
 ### Phase 02 — Kubernetes Networking Internals
 
-Deep inspection of every layer of Kubernetes networking. Analyzed `ip link show`
-and `ip route show` output field by field, traced a full cross-node packet walk
-from pod veth through the cni0 bridge, VXLAN encapsulation at flannel.1, FDB
-lookup, UDP/8472 on the wire, decap at the remote VTEP, and delivery to the
-destination pod. Verified with `tcpdump` hex output.
+Deep inspection of every layer of Kubernetes networking. Analyzed `ip link`,
+`ip route`, and `bridge fdb` output field by field. Traced a full cross-node
+packet walk from pod veth through the cni0 bridge, VXLAN encapsulation at
+flannel.1, FDB lookup, UDP/8472 on the wire, decap at the remote VTEP, and
+delivery to the destination pod. Verified with `tcpdump` hex output.
 
 Covered kube-proxy iptables chain mechanics (KUBE-SVC, KUBE-SEP, DNAT) and
-why O(n) chain traversal doesn't scale. Migrated from Flannel to Cilium —
-documented every failure mode (CIDR mismatch, leftover flannel state, IPv6
-sysctl, stuck Helm release, cilium_vxlan in wrong netns). Inspected Cilium's
-BPF lb maps (`lb4_services`, `lb4_backends`, `lb4_reverse_nat`) via raw
-`bpftool` hex output. Verified cross-node pod connectivity and Service
-routing via Cilium BPF maps.
+why O(n) chain traversal does not scale. Migrated from Flannel to Cilium —
+documented every failure mode encountered: CIDR mismatch, leftover flannel
+kernel state, IPv6 sysctl conflicts, stuck Helm release, `cilium_vxlan` in
+wrong netns. Inspected Cilium's BPF lb maps (`lb4_services`, `lb4_backends`,
+`lb4_reverse_nat`) via raw `bpftool` hex output. Verified cross-node pod
+connectivity and Service routing via Cilium BPF maps.
 
 Key outcome: Cilium v1.19.1 installed in kube-proxy-free mode, all nodes
 healthy, cross-node pod-to-pod verified (0% loss), Service routing via BPF
-hash maps verified.
+hash maps confirmed.
 
 ### Phase 03 — eBPF Fundamentals
 
-Conceptual foundation for everything in Phase 04 and 05. Covered the BPF VM
-(11 registers, 512-byte stack, fixed instruction encoding, JIT compilation),
-map internals (`struct bpf_map` / vtable dispatch, pre-allocation model, each
-map type's memory layout), the verifier (abstract interpretation, two-pass
-analysis, register type tracking, the mandatory NULL-check rule, bounds
-checking model), and all program types relevant to CNI work (XDP, TC, cgroup,
-kprobe/tracepoint).
+Conceptual foundation for Phases 04 and 05. Covered the BPF VM (11 registers,
+512-byte stack, fixed 8-byte instruction encoding, JIT compilation to native
+x86-64), map internals (`struct bpf_map` vtable dispatch, pre-allocation
+model, each map type's memory layout), the verifier (abstract interpretation,
+two-pass analysis, register type tracking, the mandatory NULL-check rule,
+bounds checking model), and all program types relevant to CNI work (XDP, TC,
+cgroup, kprobe/tracepoint).
 
 Key outcome: complete mental model of the BPF execution environment before
-writing a single line of code.
+writing a single line of C.
 
 ### Phase 04 — BPF Programming
 
-Six BPF programs written from scratch in C on the local machine, each
-introducing one new concept. See the companion
-[bpf_code](https://github.com/satyam19946/bpf_code) repository and
-[04-bpf-programming/README.md](04-bpf-programming/README.md) for full details.
+Six BPF programs written from scratch in C, each introducing one new concept.
+All programs live in the companion
+[bpf_code](https://github.com/satyam19946/bpf_code) repository.
 
-| Program | Core concept |
+| Program | Core concept introduced |
 |---|---|
-| `hello` | XDP attach, trace_pipe, ELF structure |
-| `packet_inspect` | Packet parsing, verifier bounds checking |
-| `packet_counter` | Hash maps, atomic increments, map iteration |
-| `connection_tracker` | Struct keys, padding discipline, `__be32` |
-| `mytcpdump` | Ringbuf, mmap, epoll, shared headers |
-| `xdp_dnat` | Map lookup, packet rewrite, checksum update, `bpf_redirect` |
+| `hello` | XDP attach, `bpf_printk`, trace_pipe, ELF sections |
+| `packet_inspect` | Ethernet + IPv4 parsing, verifier bounds checking pattern |
+| `packet_counter` | `BPF_MAP_TYPE_HASH`, atomic increment, `bpf_map_get_next_key` iteration |
+| `connection_tracker` | Struct map keys, padding discipline, `__be32` endianness |
+| `mytcpdump` | `BPF_MAP_TYPE_RINGBUF`, shared headers, TCP/UDP port parsing |
+| `xdp_dnat` | Map-driven packet rewrite, incremental checksum update, `bpf_redirect` |
 
-Key outcome: working XDP DNAT verified end-to-end — packet observed with
-rewritten destination IP on the wire inside a backend network namespace.
+Key outcome: working XDP DNAT verified end-to-end with packet rewrite
+confirmed via tcpdump inside a backend network namespace.
 
-### Phase 05 — Custom eBPF CNI (in progress)
+### Phase 05 — Custom eBPF CNI from Scratch
 
-Building a minimal but functional eBPF CNI that replaces kube-proxy:
+Built a minimal but functional eBPF CNI consisting of five programs. See
+[05-custom-cni/README.md](05-custom-cni/README.md) for full details.
 
-- CNI binary — called by kubelet on pod create/delete, sets up veth pairs
-  and IP assignment via netlink
-- XDP service load balancer — `xdp_dnat` from Phase 04 extended with
-  dynamic map population and multi-backend support
-- TC SNAT — egress program on veth host-end rewrites reply source back
-  to the VIP
-- Conntrack map — LRU hash tracking connection state
-- Control plane daemon — watches Kubernetes API, keeps BPF maps in sync
+| Program | Role |
+|---|---|
+| `tc_drop` | First TC program — hardcoded IP drop, clsact qdisc |
+| `tc_drop_map` | Map-driven policy, hit counters, map pinning |
+| `xdp_lb` | XDP service load balancer — ClusterIP DNAT |
+| `mycni` | CNI binary — kubelet entry point, veth lifecycle, IP allocation |
+| `tc_policy` | Per-pod policy enforcer — policy map, conntrack, ringbuf monitor |
+
+The final integrated flow: `tc_policy_loader` runs as a daemon, loads the
+BPF program, and pins it to `/sys/fs/bpf/`. When kubelet calls `mycni ADD`,
+the binary creates the veth pair, sets up the pod network namespace, retrieves
+the pinned program via `bpf_obj_get`, attaches it to the new veth (ingress +
+egress), and writes the pod's policy entry into the pinned `policy_map`. The
+daemon streams policy decisions (ALLOWED, DROPPED, CT_HIT) to stdout in real
+time via the ringbuf.
+
+Key outcome: complete CNI loop verified — `mycni ADD` sets up pod networking
+and attaches policy enforcement automatically, conntrack allows established
+connection replies without policy map re-lookup, `mycni DEL` detaches programs
+and tears down the veth cleanly.
 
 ## Key concepts by phase
 
-**Phase 01:** kubeadm bootstrap, CNI chicken-and-egg, containerd as CRI,
-static IPs for cluster stability, kube-proxy intentional omission.
+**Phase 01:** kubeadm bootstrap, CNI chicken-and-egg problem, containerd as
+CRI, kube-proxy intentional omission, Vagrant + libvirt networking.
 
 **Phase 02:** veth pairs, cni0 bridge, VXLAN/VTEP/FDB, the `onlink` route
-flag, VXLAN 50-byte overhead, kube-proxy O(n) iptables vs Cilium O(1) BPF
-maps, Cilium's three-map load balancer architecture, `sk_buff` internals,
-XDP hook placement relative to NAPI.
+flag, 50-byte VXLAN overhead, kube-proxy O(n) iptables vs Cilium O(1) BPF
+maps, Cilium's three-map load balancer architecture, XDP hook placement
+relative to NAPI poll loop.
 
 **Phase 03:** BPF as a hosted ISA, 11-register calling convention, 512-byte
 stack, fixed 8-byte instruction encoding, JIT compilation, `bpf_map_ops`
 vtable dispatch, pre-allocation model, verifier abstract interpretation,
 `PTR_TO_PACKET` vs `PTR_TO_MAP_VALUE` type system, BTF and CO-RE.
 
-**Phase 04:** Two-file structure, ELF sections, bounds checking pattern,
-struct key padding, atomic counters, ringbuf zero-copy model, mmap and page
-table entries, incremental checksum update, `bpf_redirect`, verifier error
-reading.
+**Phase 04:** Two-file program structure, ELF sections and SEC() macros,
+bounds checking pattern, struct key padding, atomic counters, ringbuf
+zero-copy model, incremental ones-complement checksum update, verifier error
+reading (instruction-level annotation, reference leak detection).
+
+**Phase 05:** TC vs XDP attachment points and their trade-offs, `clsact`
+qdisc, generic vs native XDP on virtual interfaces, CNI spec protocol,
+`nsenter` for netns access by path, BPF program and map pinning for
+cross-process sharing, `LRU_HASH` for automatic CT entry eviction,
+ringbuf reservation lifetime rules enforced by the verifier.
 
 ## Running the cluster
 
@@ -166,4 +192,6 @@ Requires: libvirt, vagrant-libvirt plugin, KVM/QEMU on the host.
 - [libbpf-bootstrap](https://github.com/libbpf/libbpf-bootstrap)
 - [Cilium source — bpf/bpf_lxc.c](https://github.com/cilium/cilium/blob/main/bpf/bpf_lxc.c)
 - [Cilium source — bpf/lib/lb.h](https://github.com/cilium/cilium/blob/main/bpf/lib/lb.h)
-- [XDP in practice — Cloudflare](https://blog.cloudflare.com/l4drop-xdp-ebpf-based-ddos-mitigations/)
+- [Cloudflare — XDP in practice](https://blog.cloudflare.com/l4drop-xdp-ebpf-based-ddos-mitigations/)
+- [man bpf(2)](https://man7.org/linux/man-pages/man2/bpf.2.html)
+- [man tc-bpf(8)](https://man7.org/linux/man-pages/man8/tc-bpf.8.html)
