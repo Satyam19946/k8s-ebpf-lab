@@ -4,29 +4,21 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <sys/stat.h>
-#include <sys/types.h>
 #include <arpa/inet.h>
+#include <net/if.h>
 #include "mycni.h"
 
 /* ------------------------------------------------------------------ */
-/* IP allocation — dead simple file-based pool                         */
+/* IP allocation                                                        */
 /* ------------------------------------------------------------------ */
 
-/*
- * Allocate the next free IP in NODE_SUBNET.
- * Format of ALLOC_FILE: one containerid:ip pair per line.
- *   abc123:10.244.1.5
- *   def456:10.244.1.6
- */
 int alloc_ip(const char *containerid, char *ip_out)
 {
     mkdir("/var/lib/mycni", 0755);
 
-    /* read existing allocations, find used IPs */
     int used[256] = {};
-    used[0] = used[1] = used[255] = 1;   /* .0 network, .1 gateway, .255 broadcast */
+    used[0] = used[1] = used[255] = 1;
 
     FILE *f = fopen(ALLOC_FILE, "r");
     if (f) {
@@ -40,7 +32,6 @@ int alloc_ip(const char *containerid, char *ip_out)
         fclose(f);
     }
 
-    /* find first free octet */
     int octet = -1;
     for (int i = 2; i < 255; i++) {
         if (!used[i]) { octet = i; break; }
@@ -53,7 +44,6 @@ int alloc_ip(const char *containerid, char *ip_out)
 
     snprintf(ip_out, 32, "%s.%d", NODE_SUBNET, octet);
 
-    /* append to alloc file */
     f = fopen(ALLOC_FILE, "a");
     if (!f) {
         fprintf(stderr, "mycni: cannot open alloc file: %s\n", strerror(errno));
@@ -72,10 +62,9 @@ int release_ip(const char *containerid)
 
     char lines[256][256];
     int count = 0;
-
     char line[256];
+
     while (fgets(line, sizeof(line), f) && count < 256) {
-        /* keep lines that don't match this containerid */
         if (strncmp(line, containerid, strlen(containerid)) != 0)
             strncpy(lines[count++], line, sizeof(lines[0]));
     }
@@ -110,6 +99,143 @@ int run(const char *fmt, ...)
 }
 
 /* ------------------------------------------------------------------ */
+/* BPF — attach tc_policy to a veth                                    */
+/* ------------------------------------------------------------------ */
+
+int attach_tc_policy(const char *iface)
+{
+    unsigned int ifindex = if_nametoindex(iface);
+    if (!ifindex) {
+        fprintf(stderr, "mycni: if_nametoindex %s failed\n", iface);
+        return -1;
+    }
+
+    int prog_fd = bpf_obj_get(PIN_PROG);
+    if (prog_fd < 0) {
+        fprintf(stderr, "mycni: bpf_obj_get prog failed: %s\n", strerror(errno));
+        return -1;
+    }
+
+    /* ingress */
+    LIBBPF_OPTS(bpf_tc_hook, hook_in,
+        .ifindex      = ifindex,
+        .attach_point = BPF_TC_INGRESS,
+    );
+    int err = bpf_tc_hook_create(&hook_in);
+    if (err && err != -EEXIST) {
+        fprintf(stderr, "mycni: bpf_tc_hook_create ingress failed: %d\n", err);
+        close(prog_fd);
+        return -1;
+    }
+    LIBBPF_OPTS(bpf_tc_opts, opts_in, .prog_fd = prog_fd);
+    if (bpf_tc_attach(&hook_in, &opts_in)) {
+        fprintf(stderr, "mycni: bpf_tc_attach ingress failed\n");
+        close(prog_fd);
+        return -1;
+    }
+
+    /* egress */
+    LIBBPF_OPTS(bpf_tc_hook, hook_out,
+        .ifindex      = ifindex,
+        .attach_point = BPF_TC_EGRESS,
+    );
+    err = bpf_tc_hook_create(&hook_out);
+    if (err && err != -EEXIST) {
+        fprintf(stderr, "mycni: bpf_tc_hook_create egress failed: %d\n", err);
+        close(prog_fd);
+        return -1;
+    }
+    LIBBPF_OPTS(bpf_tc_opts, opts_out, .prog_fd = prog_fd);
+    if (bpf_tc_attach(&hook_out, &opts_out)) {
+        fprintf(stderr, "mycni: bpf_tc_attach egress failed\n");
+        close(prog_fd);
+        return -1;
+    }
+
+    close(prog_fd);
+    fprintf(stderr, "mycni: tc_policy attached to %s (ingress + egress)\n", iface);
+    return 0;
+}
+
+int detach_tc_policy(const char *iface)
+{
+    unsigned int ifindex = if_nametoindex(iface);
+    if (!ifindex) return 0;  /* already gone */
+
+    LIBBPF_OPTS(bpf_tc_hook, hook_in,
+        .ifindex      = ifindex,
+        .attach_point = BPF_TC_INGRESS,
+    );
+    bpf_tc_hook_destroy(&hook_in);
+
+    LIBBPF_OPTS(bpf_tc_hook, hook_out,
+        .ifindex      = ifindex,
+        .attach_point = BPF_TC_EGRESS,
+    );
+    bpf_tc_hook_destroy(&hook_out);
+
+    fprintf(stderr, "mycni: tc_policy detached from %s\n", iface);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* BPF — write pod policy entry into pinned policy_map                 */
+/* ------------------------------------------------------------------ */
+
+int add_pod_policy(const char *pod_ip)
+{
+    int map_fd = bpf_obj_get(PIN_POLICY);
+    if (map_fd < 0) {
+        fprintf(stderr, "mycni: bpf_obj_get policy_map failed: %s\n", strerror(errno));
+        return -1;
+    }
+
+    struct in_addr addr;
+    inet_pton(AF_INET, pod_ip, &addr);
+
+    /*
+     * Default: allow this pod to reach the gateway on any TCP port.
+     * In production this would be driven by NetworkPolicy objects
+     * from the Kubernetes API.
+     */
+    struct policy_key key = {};
+    key.src_ip   = addr.s_addr;
+    key.dst_ip   = htonl(0x0af40101);  /* 10.244.1.1 gateway */
+    key.dst_port = htons(8080);
+    key.proto    = 6;                   /* TCP */
+
+    struct policy_val val = { .action = 1 };
+    if (bpf_map_update_elem(map_fd, &key, &val, BPF_ANY)) {
+        fprintf(stderr, "mycni: bpf_map_update_elem failed: %s\n", strerror(errno));
+        close(map_fd);
+        return -1;
+    }
+
+    fprintf(stderr, "mycni: policy entry added for pod %s\n", pod_ip);
+    close(map_fd);
+    return 0;
+}
+
+int remove_pod_policy(const char *pod_ip)
+{
+    int map_fd = bpf_obj_get(PIN_POLICY);
+    if (map_fd < 0) return 0;  /* map gone, nothing to do */
+
+    struct in_addr addr;
+    inet_pton(AF_INET, pod_ip, &addr);
+
+    struct policy_key key = {};
+    key.src_ip   = addr.s_addr;
+    key.dst_ip   = htonl(0x0af40101);
+    key.dst_port = htons(8080);
+    key.proto    = 6;
+
+    bpf_map_delete_elem(map_fd, &key);
+    close(map_fd);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* ADD                                                                  */
 /* ------------------------------------------------------------------ */
 
@@ -119,22 +245,21 @@ int cmd_add(struct cni_config *cfg)
     if (alloc_ip(cfg->cni_containerid, pod_ip) < 0)
         return -1;
 
-    /* generate a veth name from the container ID (first 8 chars) */
     char host_veth[16];
     snprintf(host_veth, sizeof(host_veth), "%s%.8s",
              VETH_PREFIX, cfg->cni_containerid);
 
-    /* 1. create veth pair in host netns */
+    /* 1. create veth pair */
     if (run("ip link add %s type veth peer name %s",
             host_veth, cfg->cni_ifname) != 0)
         return -1;
 
-    /* 2. move pod-side into the pod netns */
+    /* 2. move pod-side into pod netns */
     if (run("ip link set %s netns %s",
             cfg->cni_ifname, cfg->cni_netns) != 0)
         return -1;
 
-    /* 3. assign IP to pod-side interface inside pod netns */
+    /* 3. assign IP inside pod netns */
     if (run("nsenter --net=%s -- ip addr add %s/24 dev %s",
             cfg->cni_netns, pod_ip, cfg->cni_ifname) != 0)
         return -1;
@@ -144,12 +269,12 @@ int cmd_add(struct cni_config *cfg)
             cfg->cni_netns, cfg->cni_ifname) != 0)
         return -1;
 
-    /* 5. bring loopback up inside pod netns */
+    /* 5. bring loopback up */
     if (run("nsenter --net=%s -- ip link set lo up",
             cfg->cni_netns) != 0)
         return -1;
 
-    /* 6. add default route in pod netns via gateway */
+    /* 6. default route via gateway */
     if (run("nsenter --net=%s -- ip route add default via %s",
             cfg->cni_netns, GATEWAY_IP) != 0)
         return -1;
@@ -158,11 +283,19 @@ int cmd_add(struct cni_config *cfg)
     if (run("ip link set %s up", host_veth) != 0)
         return -1;
 
-    /* 8. add host route to pod IP via host-side veth */
+    /* 8. host route to pod */
     if (run("ip route add %s/32 dev %s", pod_ip, host_veth) != 0)
         return -1;
 
-    /* 9. write CNI result JSON to stdout — kubelet reads this */
+    /* 9. attach tc_policy BPF program to the new veth */
+    if (attach_tc_policy(host_veth) != 0)
+        return -1;
+
+    /* 10. write policy entry for this pod into the pinned map */
+    if (add_pod_policy(pod_ip) != 0)
+        return -1;
+
+    /* 11. return CNI result JSON to kubelet */
     printf("{\n");
     printf("  \"cniVersion\": \"0.4.0\",\n");
     printf("  \"interfaces\": [{\n");
@@ -186,14 +319,17 @@ int cmd_add(struct cni_config *cfg)
 
 int cmd_del(struct cni_config *cfg)
 {
-    /* generate the same veth name we used on ADD */
     char host_veth[16];
     snprintf(host_veth, sizeof(host_veth), "%s%.8s",
              VETH_PREFIX, cfg->cni_containerid);
 
-    /* deleting the host-side veth automatically deletes the peer */
+    /* detach BPF before deleting the interface */
+    detach_tc_policy(host_veth);
+
+    /* delete veth — peer inside pod netns is deleted automatically */
     run("ip link del %s", host_veth);
 
+    /* release IP allocation */
     release_ip(cfg->cni_containerid);
 
     return 0;
@@ -207,10 +343,9 @@ int main(void)
 {
     struct cni_config cfg = {};
 
-    /* read environment variables kubelet set */
-    const char *cmd = getenv("CNI_COMMAND");
-    const char *netns = getenv("CNI_NETNS");
-    const char *ifname = getenv("CNI_IFNAME");
+    const char *cmd         = getenv("CNI_COMMAND");
+    const char *netns       = getenv("CNI_NETNS");
+    const char *ifname      = getenv("CNI_IFNAME");
     const char *containerid = getenv("CNI_CONTAINERID");
 
     if (!cmd || !containerid) {
@@ -230,8 +365,6 @@ int main(void)
         return cmd_del(&cfg) == 0 ? 0 : 1;
 
     if (strcmp(cfg.cni_command, "CHECK") == 0) {
-        /* CHECK: verify network is still set up correctly */
-        /* minimal implementation — just return success */
         printf("{\"cniVersion\": \"0.4.0\"}\n");
         return 0;
     }
