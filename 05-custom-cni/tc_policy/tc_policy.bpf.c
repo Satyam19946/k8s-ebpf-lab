@@ -7,6 +7,8 @@
 #include <linux/in.h>
 #include <bpf/bpf_endian.h>
 
+#include "tc_monitor.h"
+
 struct policy_key {
     __be32  src_ip;
     __be32  dst_ip;
@@ -47,6 +49,11 @@ struct {
     __type(key,         struct ct_key);
     __type(value,       struct ct_val);
 } ct_map SEC(".maps");
+
+struct {
+    __uint(type,        BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 1 << 20);
+} monitor_rb SEC(".maps");
 
 SEC("tc")
 int tc_policy(struct __sk_buff *skb)
@@ -92,9 +99,23 @@ int tc_policy(struct __sk_buff *skb)
     ctkey.proto     = iph->protocol;
 
     struct ct_val *ctval = bpf_map_lookup_elem(&ct_map, &ctkey);
+    
+    struct monitor_event *e = bpf_ringbuf_reserve(&monitor_rb, sizeof(*e), 0);
+    if (e){
+        e->src_ip       = iph->saddr;
+        e->dst_ip       = iph->daddr;
+        e->proto        = iph->protocol;
+        e->src_port     = tcp->source;
+        e->dst_port     = tcp->dest;
+    }
+
     if (ctval && ctval->state){
         bpf_printk("Found connection in ct_map From:0x%08x:%d\n", 
                     bpf_ntohl(ctkey.src_ip), bpf_ntohs(ctkey.src_port));
+        if (e){
+            e->action = ACTION_CT_HIT;
+            bpf_ringbuf_submit(e, 0);
+        }
         return TC_ACT_OK;
     }
 
@@ -121,10 +142,19 @@ int tc_policy(struct __sk_buff *skb)
         ctv.state = 1;
         bpf_map_update_elem(&ct_map, &ctkey, &ctv, BPF_ANY);
         bpf_map_update_elem(&ct_map, &reply_key, &ctv, BPF_ANY);
+        if(e){
+            e->action = ACTION_ALLOWED;
+            bpf_ringbuf_submit(e, 0);
+        }
         return TC_ACT_OK;
     }
     bpf_printk("Blocking connection from 0x%08x to 0x%08x:%d\n",
                     bpf_ntohl(iph->saddr), bpf_ntohl(iph->daddr), bpf_ntohs(tcp->dest));
+    
+    if (e) {
+        e->action = ACTION_DROPPED;
+        bpf_ringbuf_submit(e, 0);
+    }
     return TC_ACT_SHOT;
 }
 

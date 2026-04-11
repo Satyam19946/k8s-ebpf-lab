@@ -30,9 +30,9 @@ xdp_lb:
 		xdp_lb/xdp_lb_loader.c $(LDFLAGS)
 
 tc_policy:
-	$(CLANG) $(CFLAGS) -c tc_policy/tc_policy.bpf.c \
+	$(CLANG) $(CFLAGS) -I tc_policy -c tc_policy/tc_policy.bpf.c \
 		-o tc_policy/tc_policy.bpf.o
-	$(CC) -O2 -g -o tc_policy/tc_policy_loader \
+	$(CC) -O2 -g -I tc_policy -o tc_policy/tc_policy_loader \
 		tc_policy/tc_policy_loader.c $(LDFLAGS)
 
 clean:
